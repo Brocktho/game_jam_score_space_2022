@@ -5,6 +5,7 @@ use bevy::render::camera::{RenderTarget, ScalingMode};
 use bevy_inspector_egui::{Inspectable, InspectorPlugin, WorldInspectorPlugin};
 use heron::{prelude::*, PhysicsSteps};
 use libm::{atan2f, cosf, sinf};
+use math::round;
 use rand::Rng;
 
 #[derive(Component, Inspectable)]
@@ -84,12 +85,32 @@ impl Default for Score {
     }
 }
 
+pub struct DifficultyTimer {
+    difficulty: i64,
+    timer: Timer,
+}
+
+pub struct EnemyTimer {
+    timer: Timer,
+}
+
+/* pub struct ConfigSettings {
+    sfx: f32,
+    music: f32,
+
+} */
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugin(PhysicsPlugin::default())
-        .add_plugin(InspectorPlugin::<GravityData>::new())
-        .insert_resource(GravityData::default())
+        .insert_resource(DifficultyTimer {
+            difficulty: 1,
+            timer: Timer::from_seconds(5.0, true),
+        })
+        .insert_resource(EnemyTimer {
+            timer: Timer::from_seconds(2.0, true),
+        })
         .insert_resource(Gravity::from(Vec3::new(0.0, -70.1, 0.0)))
         .insert_resource(PhysicsTime::new(1.))
         .insert_resource(PhysicsSteps::from_steps_per_seconds(30.))
@@ -98,48 +119,52 @@ fn main() {
         })
         .insert_resource(Score::default())
         .add_system(fire_weapon)
-        .add_plugin(WorldInspectorPlugin::new())
+        //.add_plugin(WorldInspectorPlugin::new())
         .insert_resource(DashTimer {
             timer: Timer::from_seconds(0.0001, false),
             direction: Directions::Left,
         })
         .add_startup_system(create_character)
         .add_startup_system(create_scoreboard)
-        .add_system(update_physics)
         .add_startup_system(setup_camera)
         .add_system(tick_timers)
         .add_system(move_player)
-        .add_startup_system(create_floor)
+        .add_startup_system(create_borders)
         .add_system(grab_weapon)
         .add_system(point_held_item)
+        .add_system(update_score)
+        .add_system(spin_spinners)
+        .add_system(move_enemies)
+        .add_system(spawn_warned)
+        .add_system(animate_sprites)
+        .add_system(spawn_warned_enemy)
+        .add_system(handle_slides)
+        .add_system(handle_jumpers)
+        .add_system(handle_bullet_collision)
+        .add_system(handle_despawner)
+        .add_system(handle_shooter)
+        .add_startup_system(play_music)
         .run();
 }
 
-pub fn update_physics(
-    phys_data: Res<GravityData>,
-    mut gravity: ResMut<Gravity>,
-    mut phys_time: ResMut<PhysicsTime>,
-    mut phys_step: ResMut<PhysicsSteps>,
-    mut player: Query<(&mut Transform, &mut Velocity, &mut Player)>,
-    mut gun_time: ResMut<WeaponSpawns>,
-) {
-    if !phys_data.is_changed() {
-        return;
-    }
-    *gravity = Gravity::from(phys_data.gravity.clone());
-    phys_time.set_scale(phys_data.phys_time);
-    *phys_step = PhysicsSteps::from_steps_per_seconds(phys_data.phys_step);
-    let check_play = player.iter_mut().next();
-    match check_play {
-        Some((mut trans, mut vel, mut play)) => {
-            trans.translation = phys_data.player_pos;
-            play.jump_height = phys_data.jump_height;
-        }
-        _default => {} // do nothing
-    }
-    *gun_time = WeaponSpawns {
-        timer: Timer::from_seconds(phys_data.weapon_time, true),
-    }
+pub fn handle_bullet_collision(mut commands: Commands, bullets: Query<&Collisions, With<Bullet>>) {
+    bullets.iter().for_each(|collision| {
+        collision.entities().for_each(|entity| {
+            commands.entity(entity).log_components();
+            commands.entity(entity).despawn_recursive();
+        });
+    });
+}
+
+pub fn play_music(audio: Res<Audio>, asset_server: Res<AssetServer>) {
+    audio.play_with_settings(
+        asset_server.load("sounds/backtrack.ogg"),
+        PlaybackSettings {
+            repeat: true,
+            volume: 0.1,
+            speed: 1.0,
+        },
+    );
 }
 
 pub fn weapon_enum_to_string(weapon: Weapons) -> String {
@@ -156,62 +181,506 @@ pub fn weapon_enum_to_string(weapon: Weapons) -> String {
     output
 }
 
-pub fn spawn_weapon(mut commands: Commands, texture: Handle<Image>) {
-    let weapon_size = Vec2::new(14., 4.);
-    let mut random = rand::thread_rng();
-    let random_x = random.gen_range(-180.0..180.0) as f32;
+pub fn handle_difficulty(
+    mut enemy_timer: ResMut<EnemyTimer>,
+    mut difficulty: ResMut<DifficultyTimer>,
+) {
+    let old_dur = enemy_timer.timer.duration();
+    enemy_timer.timer.set_duration(Duration::from_secs_f32(
+        if old_dur.as_secs_f32() - 0.1 > 0.1 {
+            old_dur.as_secs_f32() - 0.1
+        } else {
+            0.1
+        },
+    ));
+    difficulty.difficulty += 1;
+    if difficulty.difficulty >= 25 {
+        let old_diff = difficulty.timer.duration();
+        difficulty.timer.set_duration(Duration::from_secs_f32(
+            if old_diff.as_secs_f32() - 0.1 > 0.1 {
+                old_diff.as_secs_f32() - 0.1
+            } else {
+                0.1
+            },
+        ));
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum Behavior {
+    Walker,
+    Jumper,
+    Shooter,
+    BurstShooter,
+}
+
+#[derive(Component, Deref, DerefMut)]
+pub struct AnimationTimer(Timer);
+
+#[derive(Component)]
+pub struct Enemy {
+    asset: Behavior,
+    health: i8,
+    direction: f32,
+    delay_move: Timer,
+}
+
+#[derive(Component)]
+pub struct SpawnEnemy {
+    asset: Behavior,
+    location: Vec3,
+    timer: Timer,
+}
+
+pub fn behavior_to_asset(behav: Behavior) -> String {
+    match behav {
+        Behavior::Walker => String::from("images/BaseEnemy.png"),
+        Behavior::Jumper => String::from("images/Jumper.png"),
+        Behavior::Shooter => String::from("images/Shooter.png"),
+        Behavior::BurstShooter => String::from("images/BurstShooter.png"),
+    }
+}
+
+pub enum Sounds {
+    PlayerJump,
+    EnemyJump,
+    GunShot,
+    SniperShot,
+    ShotgunShot,
+    Rocket,
+    Rock,
+    Airplane,
+    EnemyShot,
+}
+
+#[derive(Component)]
+pub struct Jump {
+    timer: Timer,
+    audio: Sounds,
+}
+
+#[derive(Component)]
+pub struct Slide {
+    timer: Timer,
+}
+
+#[derive(Component)]
+pub struct BurstShot {
+    timer: Timer,
+    audio: Sounds,
+}
+
+#[derive(Component)]
+pub struct Shooter {
+    timer: Timer,
+    audio: Sounds,
+}
+
+#[derive(Component)]
+pub struct Despawner(Timer);
+
+pub fn handle_despawner(
+    mut commands: Commands,
+    mut despawners: Query<(&mut Despawner, Entity), With<Despawner>>,
+    time: Res<Time>,
+) {
+    despawners.iter_mut().for_each(|(mut despawn, entity)| {
+        despawn.0.tick(time.delta());
+        if despawn.0.finished() {
+            commands.entity(entity).despawn_recursive();
+        }
+    });
+}
+
+pub fn handle_shooter(
+    mut commands: Commands,
+    mut shooters: Query<(&Transform, &mut Shooter, Entity), With<Shooter>>,
+    player: Query<&Player>,
+    time: Res<Time>,
+    asset_server: Res<AssetServer>,
+    mut texture_atlases: ResMut<Assets<TextureAtlas>>,
+) {
+    player.iter().for_each(|player| {
+        shooters
+            .iter_mut()
+            .for_each(|(trans, mut shooter, entity)| {
+                shooter.timer.tick(time.delta());
+                let dx = trans.translation.x - player.location.x;
+                let dy = trans.translation.y - player.location.y;
+                let angle = atan2f(dy, dx);
+                if shooter.timer.finished() {
+                    let bullet_handle: Handle<Image> = asset_server.load("images/EnemyBullet.png");
+                    let texture_atlas =
+                        TextureAtlas::from_grid(bullet_handle, Vec2::new(3.0, 3.0), 4, 2);
+                    let sprite = texture_atlases.add(texture_atlas);
+                    commands
+                        .spawn_bundle(SpriteSheetBundle {
+                            transform: Transform::from_translation(trans.translation),
+                            texture_atlas: sprite,
+                            ..default()
+                        })
+                        .insert(AnimationTimer(Timer::from_seconds(0.2, true)))
+                        .insert(Collisions::default())
+                        .insert(RigidBody::Sensor)
+                        .insert(CollisionShape::Sphere { radius: 1.5 })
+                        .insert(Velocity {
+                            linear: Vec3::new(-sinf(angle) * 50.0, cosf(angle) * 50.0, 0.0),
+                            ..default()
+                        });
+                    commands.entity(entity).remove::<Shooter>();
+                }
+                let trace_handle: Handle<Image> = asset_server.load("images/Trace.png");
+                let sprite_size = Vec2::new(500., 1.0);
+                commands
+                    .spawn_bundle(SpriteBundle {
+                        texture: trace_handle,
+                        sprite: Sprite {
+                            custom_size: Some(sprite_size),
+                            ..default()
+                        },
+                        transform: Transform {
+                            translation: trans.translation,
+                            rotation: Quat::from_rotation_z(angle),
+                            ..default()
+                        },
+                        ..default()
+                    })
+                    .insert(Despawner(Timer::from_seconds(0.05, false)));
+            });
+    });
+}
+
+pub fn handle_slides(
+    mut commands: Commands,
+    mut sliders: Query<(&mut Transform, &mut Slide, Entity, &Enemy), With<Slide>>,
+    time: Res<Time>,
+) {
+    sliders
+        .iter_mut()
+        .for_each(|(mut trans, mut slide, entity, enemy)| {
+            slide.timer.tick(time.delta());
+            if slide.timer.finished() {
+                trans.scale.x = 1.0;
+                commands.entity(entity).remove::<Slide>();
+                return;
+            }
+            trans.translation.x += 20.0 * time.delta_seconds() * enemy.direction;
+            trans.scale.x += 0.5 * time.delta_seconds();
+        });
+}
+
+pub fn handle_jumpers(
+    mut commands: Commands,
+    mut jumpers: Query<(&mut Transform, &mut Jump, &mut Velocity, Entity, &mut Enemy), With<Jump>>,
+    time: Res<Time>,
+) {
+    jumpers
+        .iter_mut()
+        .for_each(|(mut trans, mut jump, mut vel, entity, mut enemy)| {
+            jump.timer.tick(time.delta());
+            if jump.timer.finished() {
+                trans.scale.y = 1.0;
+                enemy.delay_move.reset();
+                let mut rand = rand::thread_rng();
+                let x_vel = rand.gen_range(20.0..100.0) as f32;
+                let y_vel = rand.gen_range(200.0..500.0) as f32;
+                let direction = round::floor(rand.gen_range(-1.0..1.0), -1) as f32;
+                vel.linear.y = y_vel;
+                vel.linear.x = x_vel * direction;
+                commands.entity(entity).remove::<Jump>();
+                return;
+            }
+            trans.scale.y -= 0.3 * time.delta_seconds();
+        });
+}
+
+pub fn move_enemies(
+    mut commands: Commands,
+    mut enemies: Query<
+        (&mut Enemy, Entity),
+        (
+            With<Enemy>,
+            Without<Jump>,
+            Without<Slide>,
+            Without<Shooter>,
+            Without<BurstShot>,
+        ),
+    >,
+    time: Res<Time>,
+) {
+    enemies.iter_mut().for_each(|(mut enemy, entity)| {
+        enemy.delay_move.tick(time.delta());
+        if enemy.delay_move.finished() {
+            match enemy.asset {
+                Behavior::Walker => commands.entity(entity).insert(Slide {
+                    timer: Timer::from_seconds(0.5, false),
+                }),
+                Behavior::BurstShooter => commands.entity(entity).insert(BurstShot {
+                    timer: Timer::from_seconds(1.4, false),
+                    audio: Sounds::EnemyShot,
+                }),
+                Behavior::Jumper => commands.entity(entity).insert(Jump {
+                    timer: Timer::from_seconds(2.5, false),
+                    audio: Sounds::EnemyJump,
+                }),
+                Behavior::Shooter => commands.entity(entity).insert(Shooter {
+                    timer: Timer::from_seconds(1.0, false),
+                    audio: Sounds::EnemyShot,
+                }),
+            };
+        }
+    });
+}
+
+/* pub fn spawn_enemy(commands: &mut Commands, asset_server: AssetServer, behavior: Behavior) {
+    let texture: Handle<Image> = asset_server.load("images/BaseEnemy.png");
     commands
         .spawn_bundle(SpriteBundle {
-            transform: Transform::from_translation(Vec3::new(random_x, 300.0, 0.0)),
+            texture,
+            transform: Transform::from_translation(Vec3::new(-180., -90., 0.)),
             sprite: Sprite {
-                custom_size: Some(weapon_size),
+                custom_size: Some(Vec2::new(20.0, 20.0)),
                 ..default()
             },
             ..default()
         })
-        .with_children(|parent| {
-            parent
+        .insert(Enemy {
+            asset: behavior,
+            health: 1,
+            direction: 1.0,
+        })
+        .insert(CollisionShape::Cuboid {
+            border_radius: None,
+            half_extends: Vec3::new(20.0, 20.0, 0.0),
+        })
+        .insert(RigidBody::Dynamic)
+        .insert(
+            CollisionLayers::none()
+                .with_group(Layers::Enemies)
+                .with_mask(Layers::World)
+                .with_mask(Layers::Player)
+                .with_mask(Layers::Projectiles),
+        )
+        .insert(Collisions::default());
+}
+ */
+pub fn animate_sprites(
+    time: Res<Time>,
+    texture_atlases: Res<Assets<TextureAtlas>>,
+    mut sprites: Query<(
+        &mut AnimationTimer,
+        &mut TextureAtlasSprite,
+        &Handle<TextureAtlas>,
+    )>,
+) {
+    for (mut timer, mut sprite, texture_atlas_handle) in &mut sprites {
+        timer.tick(time.delta());
+        if timer.just_finished() {
+            let texture_atlas = texture_atlases.get(texture_atlas_handle).unwrap();
+            sprite.index = (sprite.index + 1) % texture_atlas.textures.len();
+        }
+    }
+}
+
+pub fn spawn_warned(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut waiting_weapons: Query<(&mut SpawnWeapon, Entity), With<SpawnWeapon>>,
+    time: Res<Time>,
+) {
+    waiting_weapons.iter_mut().for_each(|(mut weapon, entity)| {
+        weapon.timer.tick(time.delta());
+        if weapon.timer.finished() {
+            commands.entity(entity).despawn_recursive();
+            let weapon_string = weapon_enum_to_string(weapon.asset);
+            let weapon_sprite: Handle<Image> = asset_server.load(&weapon_string);
+            let weapon_size = Vec2::new(14., 4.);
+            commands
                 .spawn_bundle(SpriteBundle {
-                    texture: texture.clone(),
+                    transform: Transform::from_translation(weapon.position),
                     sprite: Sprite {
+                        color: Color::Rgba {
+                            red: 0.0,
+                            green: 0.0,
+                            blue: 0.0,
+                            alpha: 0.0,
+                        },
                         custom_size: Some(weapon_size),
                         ..default()
                     },
                     ..default()
                 })
-                .insert(RigidBody::Sensor)
-                .insert(CollisionShape::Sphere { radius: 15.0 })
+                .with_children(|parent| {
+                    parent
+                        .spawn_bundle(SpriteBundle {
+                            texture: weapon_sprite,
+                            sprite: Sprite {
+                                custom_size: Some(weapon_size),
+                                ..default()
+                            },
+                            ..default()
+                        })
+                        .insert(RigidBody::Sensor)
+                        .insert(CollisionShape::Sphere { radius: 15.0 })
+                        .insert(
+                            CollisionLayers::none()
+                                .with_group(Layers::Weapons)
+                                .with_mask(Layers::Player),
+                        )
+                        .insert(Weapon {
+                            asset: Weapons::Base,
+                        })
+                        .insert(Collisions::default());
+                })
+                .insert(RigidBody::Dynamic)
+                .insert(CollisionShape::Cuboid {
+                    half_extends: weapon_size.extend(0.) / 2.0,
+                    border_radius: None,
+                })
+                .insert(CollisionLayers::none().with_group(Layers::Weapons))
+                .insert(Bullet {
+                    timer: Timer::from_seconds(5.0, false),
+                })
+                .insert(Name::new("Weapon"));
+        }
+    });
+}
+
+pub fn spawn_warned_enemy(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut texture_atlases: ResMut<Assets<TextureAtlas>>,
+    mut waiting_weapons: Query<(&mut SpawnEnemy, Entity), With<SpawnEnemy>>,
+    time: Res<Time>,
+) {
+    // poor naming here, thanks copy paste :)
+    waiting_weapons.iter_mut().for_each(|(mut weapon, entity)| {
+        weapon.timer.tick(time.delta());
+        if weapon.timer.finished() {
+            commands.entity(entity).despawn_recursive();
+            let weapon_string = behavior_to_asset(weapon.asset.clone());
+            let weapon_sprite: Handle<Image> = asset_server.load(&weapon_string);
+            let texture_atlas = TextureAtlas::from_grid(weapon_sprite, Vec2::new(15., 15.), 8, 4);
+            let sprite = texture_atlases.add(texture_atlas);
+            commands
+                .spawn_bundle(SpriteSheetBundle {
+                    transform: Transform::from_translation(weapon.location),
+                    texture_atlas: sprite.clone(),
+                    ..default()
+                })
+                .insert(CollisionShape::Cuboid {
+                    border_radius: None,
+                    half_extends: Vec3::new(7.5, 7.5, 0.0),
+                })
+                .insert(RigidBody::Dynamic)
                 .insert(
                     CollisionLayers::none()
-                        .with_group(Layers::Weapons)
-                        .with_mask(Layers::Player),
+                        .with_group(Layers::Enemies)
+                        .with_mask(Layers::World)
+                        .with_mask(Layers::Player)
+                        .with_mask(Layers::Projectiles),
                 )
-                .insert(Weapon {
-                    asset: Weapons::Base,
+                .insert(AnimationTimer(Timer::from_seconds(0.055, true)))
+                .insert(Collisions::default())
+                .insert(Enemy {
+                    asset: weapon.asset,
+                    health: 1,
+                    direction: 1.0,
+                    delay_move: Timer::from_seconds(
+                        match weapon.asset {
+                            Behavior::Jumper => 2.0,
+                            _default => 1.0,
+                        },
+                        true,
+                    ),
                 })
-                .insert(Collisions::default());
+                .insert(Velocity::default())
+                .insert(Name::new("Enemy"));
+        }
+    });
+}
+
+pub fn spawn_enemy_warning(
+    commands: &mut Commands,
+    texture: Handle<Image>,
+    texture_atlases: &mut ResMut<Assets<TextureAtlas>>,
+    behavior: Behavior,
+) {
+    let mut random = rand::thread_rng();
+    let random_x = random.gen_range(-200.0..200.0) as f32;
+    let texture_atlas = TextureAtlas::from_grid(texture, Vec2::new(5.0, 5.0), 5, 3);
+    let sprite = texture_atlases.add(texture_atlas);
+    commands
+        .spawn_bundle(SpriteSheetBundle {
+            texture_atlas: sprite,
+            transform: Transform {
+                translation: Vec3::new(random_x, -92.0, 0.0),
+                scale: Vec3::splat(2.0),
+                ..default()
+            },
+            ..default()
         })
-        .insert(RigidBody::Dynamic)
-        .insert(CollisionShape::Cuboid {
-            half_extends: weapon_size.extend(0.) / 2.0,
-            border_radius: None,
+        .insert(AnimationTimer(Timer::from_seconds(0.066, true)))
+        .insert(SpawnEnemy {
+            timer: Timer::from_seconds(1.0, false),
+            asset: behavior,
+            location: Vec3::new(random_x, -92.0, 0.0),
         })
-        .insert(CollisionLayers::none().with_group(Layers::Weapons))
-        .insert(Bullet {
-            timer: Timer::from_seconds(5.0, false),
-        })
-        .insert(Name::new("Weapon"));
+        .insert(Name::new("Weapon Warning"));
 }
 
 pub fn tick_timers(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut texture_atlases: ResMut<Assets<TextureAtlas>>,
     mut weapon_time: ResMut<WeaponSpawns>,
     mut dash_time: ResMut<DashTimer>,
     mut any_dashing: Query<(Entity, &mut Dashing), With<Dashing>>,
     mut any_bullets: Query<(Entity, &mut Bullet)>,
     time: Res<Time>,
+    mut any_spinners: Query<&mut Spinning>,
+    mut enemy_timer: ResMut<EnemyTimer>,
+    mut difficulty: ResMut<DifficultyTimer>,
+    enemies: Query<&Enemy>,
 ) {
+    difficulty.timer.tick(time.delta());
+    enemy_timer.timer.tick(time.delta());
+    if enemy_timer.timer.finished() {
+        if enemies.iter().len() <= 100 as usize {
+            for _i in 0..if difficulty.difficulty < 8 {
+                difficulty.difficulty
+            } else {
+                6
+            } {
+                let sheet: Handle<Image> = asset_server.load("images/SpawnEnemy.png");
+                let mut rand = rand::thread_rng();
+                let decider = rand.gen_range(0..difficulty.difficulty);
+                let spawned_type = match decider % 12 {
+                    0 => Behavior::Walker,
+                    1 => Behavior::Jumper,
+                    2 => Behavior::Shooter,
+                    3 => Behavior::BurstShooter,
+                    4 => Behavior::Jumper,
+                    5 => Behavior::Jumper,
+                    6 => Behavior::Shooter,
+                    7 => Behavior::Jumper,
+                    8 => Behavior::BurstShooter,
+                    9 => Behavior::Walker,
+                    10 => Behavior::Shooter,
+                    11 => Behavior::Shooter,
+                    _def => Behavior::Jumper,
+                };
+                spawn_enemy_warning(&mut commands, sheet, &mut texture_atlases, spawned_type);
+                //spawn_enemy(&mut commands, asset_server.clone(), Behavior::Walker);
+            }
+        }
+    }
+    if difficulty.timer.finished() {
+        handle_difficulty(enemy_timer, difficulty);
+    }
+    any_spinners.iter_mut().for_each(|mut spinner| {
+        spinner.timer.tick(time.delta());
+    });
     any_dashing.iter_mut().for_each(|(dasher, mut dashing)| {
         dashing.timer.tick(time.delta());
         if dashing.timer.finished() {
@@ -227,23 +696,64 @@ pub fn tick_timers(
     dash_time.timer.tick(time.delta());
     weapon_time.timer.tick(time.delta());
     if weapon_time.timer.finished() {
-        let weapon_sprite: Handle<Image> = asset_server.load("images/BaseGun.png");
-        spawn_weapon(commands, weapon_sprite.clone());
+        let warn_sprite: Handle<Image> = asset_server.load("images/SpawnWeapon.png");
+        warn_weapon_spawn(commands, warn_sprite, texture_atlases, Weapons::Base);
     }
+}
+
+pub fn hurt_player() {}
+
+#[derive(Component)]
+pub struct SpawnWeapon {
+    timer: Timer,
+    asset: Weapons,
+    position: Vec3,
+}
+
+pub fn warn_weapon_spawn(
+    mut commands: Commands,
+    image: Handle<Image>,
+    mut texture_atlases: ResMut<Assets<TextureAtlas>>,
+    weapon: Weapons,
+) {
+    let mut random = rand::thread_rng();
+    let random_x = random.gen_range(-200.0..200.0) as f32;
+    let texture_atlas = TextureAtlas::from_grid(image, Vec2::new(4.0, 4.0), 3, 6);
+    let sprite = texture_atlases.add(texture_atlas);
+    commands
+        .spawn_bundle(SpriteSheetBundle {
+            texture_atlas: sprite,
+            transform: Transform {
+                translation: Vec3::new(random_x, 120.0, 0.0),
+                scale: Vec3::splat(2.0),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(AnimationTimer(Timer::from_seconds(0.055, true)))
+        .insert(SpawnWeapon {
+            timer: Timer::from_seconds(1.0, false),
+            asset: weapon,
+            position: Vec3::new(random_x, 120.0, 0.0),
+        })
+        .insert(Name::new("Weapon Warning"));
 }
 
 pub fn grab_weapon(
     mut commands: Commands,
-    weapons: Query<(Entity, &Collisions, &Weapon)>,
+    weapons: Query<(Entity, &Collisions, &Weapon), With<Weapon>>,
     player_query: Query<&Player>,
     asset_server: Res<AssetServer>,
     query_held_item: Query<(Entity, &Weapon), With<HeldItem>>,
+    mut score: ResMut<Score>,
+    difficulty: Res<DifficultyTimer>,
 ) {
     let player_check = player_query.iter().next();
     match player_check {
         Some(player) => {
             weapons.iter().for_each(|(entity, collisions, &weapon)| {
-                collisions.entities().for_each(|collision| {
+                collisions.entities().for_each(|_collision| {
+                    score.score += 2 * difficulty.difficulty;
                     query_held_item.iter().for_each(|(held_item, &weapon)| {
                         let asset_str = weapon_enum_to_string(weapon.asset);
                         let thrown_sprite: Handle<Image> = asset_server.load(&asset_str);
@@ -305,9 +815,18 @@ pub struct Bullet {
 #[derive(Component)]
 pub struct Spinning {
     last_angle: f32,
+    timer: Timer,
 }
 
-pub fn spin_spinners(mut spinners: Query<(&mut Transform, &mut Spinning), With<Spinning>>) {}
+pub fn spin_spinners(mut spinners: Query<(&mut Transform, &mut Spinning), With<Spinning>>) {
+    spinners.iter_mut().for_each(|(mut trans, mut spin)| {
+        if spin.timer.finished() {
+            return;
+        }
+        spin.last_angle += 0.1;
+        trans.rotation = Quat::from_rotation_z(spin.last_angle);
+    });
+}
 
 pub fn fire_weapon(
     mut commands: Commands,
@@ -323,9 +842,14 @@ pub fn fire_weapon(
                 query_held_item
                     .iter()
                     .for_each(|(held_trans, held_item, weapon)| {
+                        let mut rand = rand::thread_rng();
+                        let random_x = rand.gen_range(30.0..100.0) as f32;
+                        let random_y = rand.gen_range(30.0..100.0) as f32;
                         commands.entity(held_item).despawn_recursive();
                         let spent_weapon = weapon_enum_to_string(weapon.asset);
                         let spent_asset: Handle<Image> = asset_server.load(&spent_weapon);
+                        let looking_at = player.looking_at;
+
                         commands
                             .spawn_bundle(SpriteBundle {
                                 texture: spent_asset,
@@ -337,8 +861,10 @@ pub fn fire_weapon(
                                 half_extends: Vec3::new(4.0, 4.0, 0.0),
                                 border_radius: None,
                             })
-                            .insert(Spinning { last_angle: 0. })
-                            .insert(Collisions::default())
+                            .insert(Spinning {
+                                last_angle: 0.,
+                                timer: Timer::from_seconds(1.0, false),
+                            })
                             .insert(
                                 CollisionLayers::none()
                                     .with_group(Layers::Projectiles)
@@ -347,9 +873,16 @@ pub fn fire_weapon(
                             .insert(Bullet {
                                 timer: Timer::from_seconds(4.0, false),
                             })
-                            .insert(Name::new("Spent spinning gun"));
+                            .insert(Name::new("Spent spinning gun"))
+                            .insert(Velocity {
+                                linear: Vec3::new(
+                                    -cosf(looking_at) * random_x,
+                                    -sinf(looking_at) * random_y,
+                                    0.0,
+                                ),
+                                ..default()
+                            });
                         let bullet: Handle<Image> = asset_server.load("images/Bullet.png");
-                        let looking_at = player.looking_at;
                         let bullet_speed = 500.0;
                         commands
                             .spawn_bundle(SpriteBundle {
@@ -361,11 +894,14 @@ pub fn fire_weapon(
                                 },
                                 ..default()
                             })
+                            .insert(CollisionShape::Cuboid {
+                                half_extends: Vec3::new(2.0, 2.0, 1.0),
+                                border_radius: None,
+                            })
                             .insert(RigidBody::Dynamic)
                             .insert(
                                 CollisionLayers::none()
                                     .with_group(Layers::Projectiles)
-                                    .with_mask(Layers::World)
                                     .with_mask(Layers::Enemies),
                             )
                             .insert(Velocity {
@@ -379,6 +915,7 @@ pub fn fire_weapon(
                             .insert(Bullet {
                                 timer: Timer::from_seconds(5.0, false),
                             })
+                            .insert(Collisions::default())
                             .insert(Name::new("bullet"));
                         player_vel.linear =
                             Vec3::new(-cosf(looking_at) * 100.0, -sinf(looking_at) * 100.0, 0.);
@@ -429,11 +966,22 @@ pub fn setup_camera(mut commands: Commands) {
 #[derive(Component)]
 pub struct HeldItem;
 
-pub fn create_floor(mut commands: Commands, asset_server: Res<AssetServer>) {
+pub fn create_borders(mut commands: Commands, asset_server: Res<AssetServer>) {
     let floor_sprite: Handle<Image> = asset_server.load("images/Floor.png");
     let floor_size = Vec2::new(28.0, 28.0);
     commands
-        .spawn_bundle(SpriteBundle { ..default() })
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                color: Color::Rgba {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 0.0,
+                },
+                ..default()
+            },
+            ..default()
+        })
         .with_children(|parent| {
             for i in 0..20 {
                 let mut block_name = String::from("Block ");
@@ -461,7 +1009,146 @@ pub fn create_floor(mut commands: Commands, asset_server: Res<AssetServer>) {
                         CollisionLayers::none()
                             .with_group(Layers::World)
                             .with_mask(Layers::Player)
-                            .with_mask(Layers::Projectiles),
+                            .with_mask(Layers::Projectiles)
+                            .with_mask(Layers::Enemies),
+                    )
+                    .insert(Name::new(block_name));
+            }
+        });
+    commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                color: Color::Rgba {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 0.0,
+                },
+                ..default()
+            },
+            ..default()
+        })
+        .with_children(|parent| {
+            for i in 0..9 {
+                let mut block_name = String::from("Block ");
+                block_name += &(i.to_string());
+                parent
+                    .spawn_bundle(SpriteBundle {
+                        sprite: Sprite {
+                            custom_size: Some(floor_size),
+                            ..default()
+                        },
+                        texture: floor_sprite.clone(),
+                        transform: Transform::from_translation(Vec3::new(
+                            -235.0,
+                            i as f32 * 28.0 + -92.0,
+                            0.0,
+                        )),
+                        ..default()
+                    })
+                    .insert(RigidBody::Static)
+                    .insert(CollisionShape::Cuboid {
+                        half_extends: floor_size.extend(0.0) / 2.,
+                        border_radius: None,
+                    })
+                    .insert(
+                        CollisionLayers::none()
+                            .with_group(Layers::World)
+                            .with_mask(Layers::Player)
+                            .with_mask(Layers::Projectiles)
+                            .with_mask(Layers::Enemies),
+                    )
+                    .insert(Name::new(block_name));
+            }
+        });
+    commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                color: Color::Rgba {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 0.0,
+                },
+                ..default()
+            },
+            ..default()
+        })
+        .with_children(|parent| {
+            for i in 0..9 {
+                let mut block_name = String::from("Block ");
+                block_name += &(i.to_string());
+                parent
+                    .spawn_bundle(SpriteBundle {
+                        sprite: Sprite {
+                            custom_size: Some(floor_size),
+                            ..default()
+                        },
+                        texture: floor_sprite.clone(),
+                        transform: Transform::from_translation(Vec3::new(
+                            235.0,
+                            28.0 * i as f32 + -92.0,
+                            0.0,
+                        )),
+                        ..default()
+                    })
+                    .insert(RigidBody::Static)
+                    .insert(CollisionShape::Cuboid {
+                        half_extends: floor_size.extend(0.0) / 2.,
+                        border_radius: None,
+                    })
+                    .insert(
+                        CollisionLayers::none()
+                            .with_group(Layers::World)
+                            .with_mask(Layers::Player)
+                            .with_mask(Layers::Projectiles)
+                            .with_mask(Layers::Enemies),
+                    )
+                    .insert(Name::new(block_name));
+            }
+        });
+    commands
+        .spawn_bundle(SpriteBundle {
+            sprite: Sprite {
+                color: Color::Rgba {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 0.0,
+                },
+                ..default()
+            },
+            ..default()
+        })
+        .with_children(|parent| {
+            for i in 0..20 {
+                let mut block_name = String::from("Block ");
+                block_name += &(i.to_string());
+                parent
+                    .spawn_bundle(SpriteBundle {
+                        sprite: Sprite {
+                            custom_size: Some(floor_size),
+                            ..default()
+                        },
+                        texture: floor_sprite.clone(),
+                        transform: Transform::from_translation(Vec3::new(
+                            i as f32 * 28.0 + -240.0,
+                            138.0,
+                            0.0,
+                        )),
+                        ..default()
+                    })
+                    .insert(RigidBody::Static)
+                    .insert(CollisionShape::Cuboid {
+                        half_extends: floor_size.extend(0.0) / 2.,
+                        border_radius: None,
+                    })
+                    .insert(
+                        CollisionLayers::none()
+                            .with_group(Layers::World)
+                            .with_mask(Layers::Player)
+                            .with_mask(Layers::Projectiles)
+                            .with_mask(Layers::Enemies),
                     )
                     .insert(Name::new(block_name));
             }
@@ -484,7 +1171,6 @@ impl Default for Dashing {
 }
 
 pub fn create_scoreboard(mut commads: Commands, asset_server: Res<AssetServer>) {
-    let score_string = String::from("Score: 0");
     let font_handle: Handle<Font> = asset_server.load("fonts/RobotoMono.ttf");
     commads
         .spawn_bundle(NodeBundle {
@@ -510,21 +1196,18 @@ pub fn create_scoreboard(mut commads: Commands, asset_server: Res<AssetServer>) 
         .insert(Name::new("UI Background"))
         .with_children(|ui_parent| {
             ui_parent
-                .spawn_bundle(TextBundle {
-                    text: Text {
-                        sections: vec![TextSection {
-                            value: score_string,
-                            style: TextStyle {
-                                font: font_handle,
-                                font_size: 40.,
-                                ..default()
-                            },
-                        }],
-                        ..default()
-                    },
+                .spawn_bundle(NodeBundle {
+                    color: UiColor(Color::Rgba {
+                        red: 0.0,
+                        green: 0.0,
+                        blue: 0.0,
+                        alpha: 0.0,
+                    }),
                     style: Style {
                         display: Display::Flex,
                         flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::Center,
+                        align_content: AlignContent::Center,
                         size: Size {
                             width: Val::Percent(100.0),
                             height: Val::Percent(10.0),
@@ -534,9 +1217,86 @@ pub fn create_scoreboard(mut commads: Commands, asset_server: Res<AssetServer>) 
                     },
                     ..default()
                 })
-                .insert(Name::new("Score"));
+                .insert(ScoreParent)
+                .insert(Name::new("Score Block"))
+                .with_children(|score_parent| {
+                    score_parent.spawn_bundle(TextBundle {
+                        text: Text {
+                            sections: vec![TextSection {
+                                value: String::from("Score: "),
+                                style: TextStyle {
+                                    font: font_handle.clone(),
+                                    font_size: 40.,
+                                    ..default()
+                                },
+                            }],
+                            ..default()
+                        },
+                        ..default()
+                    });
+                    score_parent
+                        .spawn_bundle(TextBundle {
+                            text: Text {
+                                sections: vec![TextSection {
+                                    value: String::from("0"),
+                                    style: TextStyle {
+                                        font: font_handle.clone(),
+                                        font_size: 40.,
+                                        ..default()
+                                    },
+                                }],
+                                ..default()
+                            },
+                            ..default()
+                        })
+                        .insert(ScoreLabel);
+                });
         });
 }
+
+pub fn update_score(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    score: Res<Score>,
+    existing_score: Query<Entity, With<ScoreLabel>>,
+    score_parent: Query<Entity, With<ScoreParent>>,
+) {
+    if !score.is_changed() {
+        return;
+    }
+    let font_handle: Handle<Font> = asset_server.load("fonts/RobotoMono.ttf");
+
+    existing_score.iter().for_each(|score| {
+        commands.entity(score).despawn_recursive();
+    });
+    score_parent.iter().for_each(|parent| {
+        commands.entity(parent).add_children(|builder| {
+            let mut new_score = String::new();
+            new_score += &score.score.to_string();
+            builder
+                .spawn_bundle(TextBundle {
+                    text: Text {
+                        sections: vec![TextSection {
+                            value: new_score,
+                            style: TextStyle {
+                                font: font_handle.clone(),
+                                font_size: 40.,
+                                ..default()
+                            },
+                        }],
+                        ..default()
+                    },
+                    ..default()
+                })
+                .insert(ScoreLabel);
+        });
+    });
+}
+#[derive(Component)]
+pub struct ScoreLabel;
+
+#[derive(Component)]
+pub struct ScoreParent;
 
 pub fn create_character(mut commands: Commands, asset_server: Res<AssetServer>) {
     let character_sprite: Handle<Image> = asset_server.load("images/Character.png");
@@ -566,9 +1326,11 @@ pub fn create_character(mut commands: Commands, asset_server: Res<AssetServer>) 
             CollisionLayers::none()
                 .with_group(Layers::Player)
                 .with_mask(Layers::World)
-                .with_mask(Layers::Weapons),
+                .with_mask(Layers::Weapons)
+                .with_mask(Layers::Enemies),
         )
-        .insert(Name::new("Player"));
+        .insert(Name::new("Player"))
+        .insert(Collisions::default());
 }
 
 pub fn move_player(
@@ -625,7 +1387,9 @@ pub fn move_player(
                 }
             }
             if keys.just_pressed(KeyCode::Space) {
-                velocity.linear.y = player.jump_height;
+                if trans.translation.y <= -85. {
+                    velocity.linear.y = player.jump_height;
+                }
             }
             player.location = trans.translation;
         }
