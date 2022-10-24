@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bevy::prelude::{Camera2dBundle, *};
 use bevy::render::camera::{RenderTarget, ScalingMode};
-use bevy_inspector_egui::{Inspectable, InspectorPlugin};
+use bevy_inspector_egui::{Inspectable, InspectorPlugin, WorldInspectorPlugin};
 use heron::{prelude::*, PhysicsSteps};
 use libm::{atan2f, cosf, sinf};
 use rand::Rng;
@@ -98,11 +98,13 @@ fn main() {
         })
         .insert_resource(Score::default())
         .add_system(fire_weapon)
+        .add_plugin(WorldInspectorPlugin::new())
         .insert_resource(DashTimer {
             timer: Timer::from_seconds(0.0001, false),
             direction: Directions::Left,
         })
         .add_startup_system(create_character)
+        .add_startup_system(create_scoreboard)
         .add_system(update_physics)
         .add_startup_system(setup_camera)
         .add_system(tick_timers)
@@ -157,7 +159,7 @@ pub fn weapon_enum_to_string(weapon: Weapons) -> String {
 pub fn spawn_weapon(mut commands: Commands, texture: Handle<Image>) {
     let weapon_size = Vec2::new(14., 4.);
     let mut random = rand::thread_rng();
-    let random_x = random.gen_range(-120.0..120.0) as f32;
+    let random_x = random.gen_range(-180.0..180.0) as f32;
     commands
         .spawn_bundle(SpriteBundle {
             transform: Transform::from_translation(Vec3::new(random_x, 300.0, 0.0)),
@@ -194,7 +196,11 @@ pub fn spawn_weapon(mut commands: Commands, texture: Handle<Image>) {
             half_extends: weapon_size.extend(0.) / 2.0,
             border_radius: None,
         })
-        .insert(CollisionLayers::none().with_group(Layers::Weapons));
+        .insert(CollisionLayers::none().with_group(Layers::Weapons))
+        .insert(Bullet {
+            timer: Timer::from_seconds(5.0, false),
+        })
+        .insert(Name::new("Weapon"));
 }
 
 pub fn tick_timers(
@@ -255,7 +261,13 @@ pub fn grab_weapon(
                             })
                             .insert(Bullet {
                                 timer: Timer::from_seconds(4.0, false),
-                            });
+                            })
+                            .insert(Name::new("Spent Weapon"))
+                            .insert(
+                                CollisionLayers::none()
+                                    .with_group(Layers::Projectiles)
+                                    .with_mask(Layers::World),
+                            );
                     });
                     let cloned = weapon.clone();
                     let string_handle = weapon_enum_to_string(cloned.asset);
@@ -263,6 +275,10 @@ pub fn grab_weapon(
                     commands.entity(entity).despawn_recursive();
                     commands
                         .spawn_bundle(SpriteBundle {
+                            sprite: Sprite {
+                                flip_x: true,
+                                ..default()
+                            },
                             texture,
                             transform: Transform::from_translation(player.location),
                             ..default()
@@ -270,7 +286,8 @@ pub fn grab_weapon(
                         .insert(HeldItem)
                         .insert(Weapon {
                             asset: cloned.asset,
-                        });
+                        })
+                        .insert(Name::new("Held Item"));
                 })
             });
         }
@@ -329,7 +346,8 @@ pub fn fire_weapon(
                             )
                             .insert(Bullet {
                                 timer: Timer::from_seconds(4.0, false),
-                            });
+                            })
+                            .insert(Name::new("Spent spinning gun"));
                         let bullet: Handle<Image> = asset_server.load("images/Bullet.png");
                         let looking_at = player.looking_at;
                         let bullet_speed = 500.0;
@@ -360,7 +378,8 @@ pub fn fire_weapon(
                             })
                             .insert(Bullet {
                                 timer: Timer::from_seconds(5.0, false),
-                            });
+                            })
+                            .insert(Name::new("bullet"));
                         player_vel.linear =
                             Vec3::new(-cosf(looking_at) * 100.0, -sinf(looking_at) * 100.0, 0.);
                     });
@@ -403,7 +422,8 @@ pub fn setup_camera(mut commands: Commands) {
             },
             ..default()
         })
-        .insert(MyCamera);
+        .insert(MyCamera)
+        .insert(Name::new("Camera"));
 }
 
 #[derive(Component)]
@@ -412,33 +432,40 @@ pub struct HeldItem;
 pub fn create_floor(mut commands: Commands, asset_server: Res<AssetServer>) {
     let floor_sprite: Handle<Image> = asset_server.load("images/Floor.png");
     let floor_size = Vec2::new(28.0, 28.0);
-    for i in 0..20 {
-        commands
-            .spawn_bundle(SpriteBundle {
-                sprite: Sprite {
-                    custom_size: Some(floor_size),
-                    ..default()
-                },
-                texture: floor_sprite.clone(),
-                transform: Transform::from_translation(Vec3::new(
-                    i as f32 * 28.0 + -240.0,
-                    -120.0,
-                    0.0,
-                )),
-                ..default()
-            })
-            .insert(RigidBody::Static)
-            .insert(CollisionShape::Cuboid {
-                half_extends: floor_size.extend(0.0) / 2.,
-                border_radius: None,
-            })
-            .insert(
-                CollisionLayers::none()
-                    .with_group(Layers::World)
-                    .with_mask(Layers::Player)
-                    .with_mask(Layers::Projectiles),
-            );
-    }
+    commands
+        .spawn_bundle(SpriteBundle { ..default() })
+        .with_children(|parent| {
+            for i in 0..20 {
+                let mut block_name = String::from("Block ");
+                block_name += &(i.to_string());
+                parent
+                    .spawn_bundle(SpriteBundle {
+                        sprite: Sprite {
+                            custom_size: Some(floor_size),
+                            ..default()
+                        },
+                        texture: floor_sprite.clone(),
+                        transform: Transform::from_translation(Vec3::new(
+                            i as f32 * 28.0 + -240.0,
+                            -120.0,
+                            0.0,
+                        )),
+                        ..default()
+                    })
+                    .insert(RigidBody::Static)
+                    .insert(CollisionShape::Cuboid {
+                        half_extends: floor_size.extend(0.0) / 2.,
+                        border_radius: None,
+                    })
+                    .insert(
+                        CollisionLayers::none()
+                            .with_group(Layers::World)
+                            .with_mask(Layers::Player)
+                            .with_mask(Layers::Projectiles),
+                    )
+                    .insert(Name::new(block_name));
+            }
+        });
 }
 
 #[derive(Component)]
@@ -456,10 +483,17 @@ impl Default for Dashing {
     }
 }
 
-pub fn create_scoreboard(mut commads: Commands, score: Res<Score>) {
+pub fn create_scoreboard(mut commads: Commands, asset_server: Res<AssetServer>) {
     let score_string = String::from("Score: 0");
+    let font_handle: Handle<Font> = asset_server.load("fonts/RobotoMono.ttf");
     commads
         .spawn_bundle(NodeBundle {
+            color: UiColor(Color::Rgba {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 0.0,
+            }),
             style: Style {
                 display: Display::Flex,
                 flex_direction: FlexDirection::ColumnReverse,
@@ -468,28 +502,39 @@ pub fn create_scoreboard(mut commads: Commands, score: Res<Score>) {
                     height: Val::Percent(100.0),
                     ..default()
                 },
+
                 ..default()
             },
             ..default()
         })
+        .insert(Name::new("UI Background"))
         .with_children(|ui_parent| {
-            ui_parent.spawn_bundle(TextBundle {
-                text: Text {
-                    sections: vec![],
-                    ..default()
-                },
-                style: Style {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    size: Size {
-                        width: Val::Percent(100.0),
-                        height: Val::Percent(20.0),
+            ui_parent
+                .spawn_bundle(TextBundle {
+                    text: Text {
+                        sections: vec![TextSection {
+                            value: score_string,
+                            style: TextStyle {
+                                font: font_handle,
+                                font_size: 40.,
+                                ..default()
+                            },
+                        }],
+                        ..default()
+                    },
+                    style: Style {
+                        display: Display::Flex,
+                        flex_direction: FlexDirection::Row,
+                        size: Size {
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(10.0),
+                            ..default()
+                        },
                         ..default()
                     },
                     ..default()
-                },
-                ..default()
-            });
+                })
+                .insert(Name::new("Score"));
         });
 }
 
@@ -522,7 +567,8 @@ pub fn create_character(mut commands: Commands, asset_server: Res<AssetServer>) 
                 .with_group(Layers::Player)
                 .with_mask(Layers::World)
                 .with_mask(Layers::Weapons),
-        );
+        )
+        .insert(Name::new("Player"));
 }
 
 pub fn move_player(
@@ -543,6 +589,7 @@ pub fn move_player(
                     dash_time.direction = Directions::Right;
                     if velocity.linear.x >= -50. {
                         trans.translation.x += 1.0;
+                        velocity.linear.x = 0.;
                     }
                 } else {
                     //trans.translation.x += 20.0;
@@ -555,6 +602,7 @@ pub fn move_player(
             } else if keys.pressed(KeyCode::D) {
                 if velocity.linear.x >= -50. {
                     trans.translation.x += 1.0;
+                    velocity.linear.x = 0.;
                 }
             }
             if keys.just_pressed(KeyCode::A) {
@@ -563,6 +611,7 @@ pub fn move_player(
                     dash_time.direction = Directions::Left;
                     if velocity.linear.x <= 50. {
                         trans.translation.x += -1.0;
+                        velocity.linear.x = 0.;
                     }
                 } else {
                     //trans.translation.x += -20.0;
@@ -572,6 +621,7 @@ pub fn move_player(
             } else if keys.pressed(KeyCode::A) {
                 if velocity.linear.x <= 50. {
                     trans.translation.x += -1.0;
+                    velocity.linear.x = 0.;
                 }
             }
             if keys.just_pressed(KeyCode::Space) {
@@ -654,6 +704,7 @@ fn point_held_item(
                             10.0,
                         );
                         held_item.translation = item_pos;
+                        held_item.rotation = Quat::from_rotation_z(angle);
                     }
                     _default => {
                         // none found
